@@ -1,0 +1,419 @@
+{
+  "name": "HRIS Offboarding Ticket Automation (Template)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Poll HRIS (every 15 min)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-460, 300],
+      "notes": "Polling beats webhooks here: many HRIS platforms do not emit a reliable termination event, and a 15-minute window is well inside the SLA for offboarding tickets."
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.HRIS_API_BASE }}/workers",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "status",
+              "value": "TERMINATED"
+            }
+          ]
+        },
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 2000
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "get-workers",
+      "name": "Get Terminated Workers (HRIS API)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-240, 300],
+      "notes": "Read-only GET. Retries 3x with backoff so a transient API blip does not silently drop a termination. Credentials come from n8n credential store, never hardcoded."
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "workers",
+        "options": {}
+      },
+      "id": "split-workers",
+      "name": "Split Out Workers",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [-20, 300],
+      "notes": "Unpacks the API's wrapped response into individual worker records so each is processed independently."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "effective-today",
+              "leftValue": "={{ $json.termination_date }}",
+              "rightValue": "={{ $now.format('yyyy-MM-dd') }}",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "filter-effective-today",
+      "name": "Filter: Effective Today Only",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2.2,
+      "position": [200, 300],
+      "notes": "Critical guardrail. Without this, every poll would re-notify on every historical termination in the system. Only terminations effective today proceed."
+    },
+    {
+      "parameters": {
+        "mode": "manual",
+        "duplicateItem": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a1",
+              "name": "employee_id",
+              "value": "={{ $json.id }}",
+              "type": "string"
+            },
+            {
+              "id": "a2",
+              "name": "full_name",
+              "value": "={{ $json.name.formatted }}",
+              "type": "string"
+            },
+            {
+              "id": "a3",
+              "name": "work_email",
+              "value": "={{ $json.emails[0].value }}",
+              "type": "string"
+            },
+            {
+              "id": "a4",
+              "name": "job_title",
+              "value": "={{ $json.title }}",
+              "type": "string"
+            },
+            {
+              "id": "a5",
+              "name": "department",
+              "value": "={{ $json.department.name }}",
+              "type": "string"
+            },
+            {
+              "id": "a6",
+              "name": "manager_email",
+              "value": "={{ $json.manager.email }}",
+              "type": "string"
+            },
+            {
+              "id": "a7",
+              "name": "termination_type",
+              "value": "={{ $json.termination_details.type }}",
+              "type": "string"
+            },
+            {
+              "id": "a8",
+              "name": "termination_date",
+              "value": "={{ $json.termination_date }}",
+              "type": "string"
+            },
+            {
+              "id": "a9",
+              "name": "dedupe_tag",
+              "value": "=offboard-{{ $json.id }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "map-worker",
+      "name": "Map Worker -> Ticket Fields",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [420, 300],
+      "notes": "Flattens the HRIS's nested response into the flat fields the rest of the workflow expects. The dedupe_tag is built here and is the key to idempotency downstream."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "has-id",
+              "leftValue": "={{ $json.employee_id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              }
+            },
+            {
+              "id": "has-email",
+              "leftValue": "={{ $json.work_email }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              }
+            },
+            {
+              "id": "valid-date",
+              "leftValue": "={{ $json.termination_date }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "validate-record",
+      "name": "Validate Record",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [640, 300],
+      "notes": "Validate BEFORE creating anything. A record missing an ID, email, or date produces a broken ticket that a human then has to clean up. Invalid records route to a human instead."
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.TICKETING_API_BASE }}/tickets",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "tag",
+              "value": "={{ $json.dedupe_tag }}"
+            }
+          ]
+        },
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 2000
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "check-existing",
+      "name": "Check Existing Ticket (Dedupe)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [860, 240],
+      "notes": "Search the ticketing system by dedupe_tag. Because the workflow polls on a schedule, the same termination WILL be seen more than once. This lookup is what makes the workflow idempotent."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "ticket-exists",
+              "leftValue": "={{ $json.tickets.length }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ticket-exists",
+      "name": "Ticket Already Exists?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1080, 240],
+      "notes": "Exists -> skip (no-op, log only). New -> create. Skipping loudly (with a Slack note) beats skipping silently."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.TICKETING_API_BASE }}/tickets",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"subject\": \"Offboarding: {{ $json.full_name }} ({{ $json.job_title }})\",\n  \"description\": \"Employee ID: {{ $json.employee_id }}\\nDepartment: {{ $json.department }}\\nManager: {{ $json.manager_email }}\\nTermination type: {{ $json.termination_type }}\\nEffective date: {{ $json.termination_date }}\\n\\nAuto-generated from HRIS. Assigned agent to complete: equipment return method, any holds.\",\n  \"type\": \"Service Request\",\n  \"priority\": 2,\n  \"tags\": [\"{{ $json.dedupe_tag }}\", \"offboarding\", \"automated\"]\n}",
+        "options": {
+          "retry": {
+            "retryOnFail": true,
+            "maxTries": 3,
+            "waitBetweenTries": 2000
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "create-ticket",
+      "name": "Create Offboarding Ticket",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1300, 160],
+      "notes": "Fields the HRIS cannot supply (equipment return method, legal holds) are deliberately left for the assigned human agent rather than guessed at by the automation."
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "={{ $env.SLACK_CHANNEL_ID }}",
+          "mode": "id"
+        },
+        "text": "=:white_check_mark: Offboarding ticket created for {{ $json.full_name }} — effective {{ $json.termination_date }}. Ticket: {{ $json.ticket_url }}",
+        "otherOptions": {}
+      },
+      "id": "notify-created",
+      "name": "Notify: Ticket Created",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [1520, 160],
+      "notes": "Success notification. The team sees the automation working rather than wondering whether it ran."
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "={{ $env.SLACK_CHANNEL_ID }}",
+          "mode": "id"
+        },
+        "text": "=:information_source: Duplicate skipped — {{ $json.full_name }} already has an open offboarding ticket. No action taken.",
+        "otherOptions": {}
+      },
+      "id": "notify-duplicate",
+      "name": "Notify: Duplicate Skipped",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [1300, 320],
+      "notes": "A skip is still an event worth surfacing. Silent no-ops are how people lose trust in an automation."
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "={{ $env.SLACK_CHANNEL_ID }}",
+          "mode": "id"
+        },
+        "text": "=:warning: Validation failed — a termination record is missing required fields and was NOT ticketed. Needs manual review. Employee ID: {{ $json.employee_id || 'MISSING' }}",
+        "otherOptions": {}
+      },
+      "id": "notify-invalid",
+      "name": "Notify: Validation Failed (Human Review)",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [860, 460],
+      "notes": "The human-in-the-loop path. Bad data never becomes a broken ticket; it becomes a person's attention."
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "={{ $env.SLACK_CHANNEL_ID }}",
+          "mode": "id"
+        },
+        "text": "=:rotating_light: API call failed after retries. A termination may not have been ticketed. Needs a human to check. Error: {{ $json.error }}",
+        "otherOptions": {}
+      },
+      "id": "notify-api-failure",
+      "name": "Notify: API Failure",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [1300, 480],
+      "notes": "Error branch. If the API fails even after retries, a person is told rather than the failure disappearing into a log nobody reads."
+    }
+  ],
+  "connections": {
+    "Poll HRIS (every 15 min)": {
+      "main": [[{ "node": "Get Terminated Workers (HRIS API)", "type": "main", "index": 0 }]]
+    },
+    "Get Terminated Workers (HRIS API)": {
+      "main": [[{ "node": "Split Out Workers", "type": "main", "index": 0 }]]
+    },
+    "Split Out Workers": {
+      "main": [[{ "node": "Filter: Effective Today Only", "type": "main", "index": 0 }]]
+    },
+    "Filter: Effective Today Only": {
+      "main": [[{ "node": "Map Worker -> Ticket Fields", "type": "main", "index": 0 }]]
+    },
+    "Map Worker -> Ticket Fields": {
+      "main": [[{ "node": "Validate Record", "type": "main", "index": 0 }]]
+    },
+    "Validate Record": {
+      "main": [
+        [{ "node": "Check Existing Ticket (Dedupe)", "type": "main", "index": 0 }],
+        [{ "node": "Notify: Validation Failed (Human Review)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Check Existing Ticket (Dedupe)": {
+      "main": [[{ "node": "Ticket Already Exists?", "type": "main", "index": 0 }]]
+    },
+    "Ticket Already Exists?": {
+      "main": [
+        [{ "node": "Notify: Duplicate Skipped", "type": "main", "index": 0 }],
+        [{ "node": "Create Offboarding Ticket", "type": "main", "index": 0 }]
+      ]
+    },
+    "Create Offboarding Ticket": {
+      "main": [[{ "node": "Notify: Ticket Created", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionTimeout": 300,
+    "saveExecutionProgress": true,
+    "saveManualExecutions": true
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": [
+    { "name": "hr" },
+    { "name": "offboarding" },
+    { "name": "template" }
+  ]
+}
